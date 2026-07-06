@@ -2,24 +2,130 @@ name: Push Workflow
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+
+env:
+  COURSE_NAME: Amazon Institute Cloud Ops
+  COHORT: Echo
 
 jobs:
-  automate:
+  setup:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify required files exist
+        run: |
+          test -f name.txt || exit 1
+          test -f devops.txt || exit 1
+          test -s name.txt || exit 1
+          test -s devops.txt || exit 1
+
+      - name: Main branch only step
+        if: github.ref == 'refs/heads/main'
+        run: echo "Running on main branch"
+
+      - name: Non-main branch only step
+        if: github.ref != 'refs/heads/main'
+        run: echo "Running on feature branch"
+
+  build:
+    needs: setup
+    runs-on: ubuntu-latest
+    env:
+      REPORT_TITLE: Daily Automation Report
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
       - name: Create log file
         run: |
           echo "Workflow executed at $(date -u)" > log.txt
-
-      - name: Print working directory
-        run: pwd
-
-      - name: Display log contents
-        run: cat log.txt
+          pwd
+          cat log.txt
 
       - name: Custom message
         run: echo "Hello from Stephen McKitrick — Echo cohort!"
+
+      - name: Read personal files
+        run: |
+          echo "=== name.txt ==="
+          cat name.txt
+          echo "=== devops.txt ==="
+          cat devops.txt
+
+      - name: Generate summary report
+        run: |
+          {
+            echo "$REPORT_TITLE"
+            echo "Generated: $(date -u)"
+            echo "Course: $COURSE_NAME"
+            echo "Cohort: $COHORT"
+            echo "Actor: ${{ github.actor }}"
+            echo "Repository: ${{ github.repository }}"
+            echo "--- name.txt ---"
+            cat name.txt
+            echo "--- devops.txt ---"
+            cat devops.txt
+          } > summary.txt
+          cat summary.txt
+
+      - name: Print environment variables
+        run: |
+          echo "COURSE_NAME=$COURSE_NAME"
+          echo "COHORT=$COHORT"
+          echo "REPORT_TITLE=$REPORT_TITLE"
+          echo "GITHUB_ACTOR=${{ github.actor }}"
+          echo "GITHUB_REPOSITORY=${{ github.repository }}"
+
+      - name: File-change condition
+        if: contains(github.event.head_commit.modified, 'name.txt') || contains(github.event.head_commit.modified, 'devops.txt')
+        run: echo "Personal files were modified in this push"
+
+      - name: Cohort expression condition
+        if: env.COHORT == 'Echo'
+        run: echo "Echo cohort step executed"
+
+      - name: Upload summary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: summary-artifact
+          path: summary.txt
+
+      - name: Write job summary
+        if: success()
+        run: |
+          echo "## Build Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "Workflow succeeded for **${{ github.repository }}**" >> "$GITHUB_STEP_SUMMARY"
+          echo "Triggered by **${{ github.actor }}**" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Failure notification
+        if: failure()
+        run: echo "BUILD FAILED in job build"
+
+  report:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download summary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: summary-artifact
+
+      - name: Display summary report
+        run: cat summary.txt
+
+  matrix-test:
+    needs: report
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        environment: [dev, prod]
+    steps:
+      - name: Print matrix configuration
+        run: |
+          echo "OS=${{ matrix.os }}"
+          echo "ENV=${{ matrix.environment }}"

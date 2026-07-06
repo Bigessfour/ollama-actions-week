@@ -1,0 +1,38 @@
+name: PR Workflow
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  pr-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate required files
+        run: |
+          test -f name.txt || exit 1
+          test -f devops.txt || exit 1
+          test -s name.txt || exit 1
+          test -s devops.txt || exit 1
+
+      - name: Print PR labels
+        run: echo "Labels=${{ toJSON(github.event.pull_request.labels) }}"
+
+      - name: Build PR summary
+        run: |
+          {
+            echo "PR Summary for #${{ github.event.pull_request.number }}"
+            echo "Generated: $(date -u)"
+            echo "--- name.txt ---"
+            cat name.txt
+            echo "--- devops.txt ---"
+            cat devops.txt
+          } > summary.txt
+          cat summary.txt
+
+      - name: Comment summary on PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr comment "${{ github.event.pull_request.number }}" --body-file summary.txt

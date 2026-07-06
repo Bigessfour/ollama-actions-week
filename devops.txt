@@ -1,1 +1,1 @@
-Your DevOps motivation here
+I'm learning DevOps to automate CI/CD pipelines, infrastructure, and reliable software delivery.
