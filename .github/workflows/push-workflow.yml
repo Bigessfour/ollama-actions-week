@@ -1,0 +1,25 @@
+name: Push Workflow
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  automate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create log file
+        run: |
+          echo "Workflow executed at $(date -u)" > log.txt
+
+      - name: Print working directory
+        run: pwd
+
+      - name: Display log contents
+        run: cat log.txt
+
+      - name: Custom message
+        run: echo "Hello from Stephen McKitrick — Echo cohort!"

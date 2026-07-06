@@ -1,0 +1,19 @@
+name: Scheduled Workflow
+
+on:
+  schedule:
+    - cron: '0 0 * * 5'
+  workflow_dispatch:
+
+jobs:
+  scheduled-run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create scheduled log
+        run: |
+          echo "Scheduled workflow executed at $(date -u)" > log.txt
+          pwd
+          cat log.txt
+          echo "Schedule: Friday midnight UTC (0 0 * * 5)"
