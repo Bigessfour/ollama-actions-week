@@ -18,10 +18,9 @@ runs:
       id: cache
       uses: actions/cache@v4
       with:
-        # Model blobs + manifests live here. Binary still installs each job
-        # (small); model layers are the multi-GB cost we avoid.
+        # Model blobs + manifests. Binary still installs each job (small).
         path: ~/.ollama
-        key: ollama-${{ runner.os }}-${{ inputs.model }}-v1
+        key: ollama-${{ runner.os }}-${{ inputs.model }}-v2
         restore-keys: |
           ollama-${{ runner.os }}-${{ inputs.model }}-
           ollama-${{ runner.os }}-
@@ -29,6 +28,7 @@ runs:
     - name: Install Ollama
       shell: bash
       run: |
+        set -euo pipefail
         if command -v ollama >/dev/null 2>&1; then
           echo "Ollama already on PATH: $(command -v ollama)"
           ollama --version || true
@@ -36,34 +36,143 @@ runs:
           echo "Installing Ollama..."
           curl -fsSL https://ollama.com/install.sh | sh
         fi
+        command -v ollama
+        ollama --version || true
 
     - name: Start Ollama service
       shell: bash
       run: |
+        set -euo pipefail
         mkdir -p "$HOME/.ollama"
         echo "Cache hit: ${{ steps.cache.outputs.cache-hit }}"
-        if curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-          echo "Ollama already serving"
-        else
-          ollama serve >/tmp/ollama-serve.log 2>&1 &
-          for i in $(seq 1 45); do
-            if curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-              echo "Ollama ready (attempt $i)"
-              break
-            fi
-            sleep 2
-          done
-        fi
-        if ! curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
-          echo "ERROR: Ollama failed to start" >&2
-          tail -50 /tmp/ollama-serve.log 2>/dev/null || true
+        echo "HOME=$HOME"
+        ls -la "$HOME/.ollama" 2>/dev/null || true
+
+        # Kill any prior server so we own a clean process
+        pkill -f 'ollama serve' 2>/dev/null || true
+        sleep 1
+
+        # Prefer explicit host; reduces flaky 503s on shared runners
+        export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+        echo "OLLAMA_HOST=$OLLAMA_HOST"
+
+        nohup ollama serve > /tmp/ollama-serve.log 2>&1 &
+        echo $! > /tmp/ollama-serve.pid
+        echo "Started ollama serve pid=$(cat /tmp/ollama-serve.pid)"
+
+        ready=0
+        for i in $(seq 1 60); do
+          if curl -sf "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
+            echo "Ollama API ready (attempt $i)"
+            ready=1
+            break
+          fi
+          # If process died, show log and restart once early
+          if [ -f /tmp/ollama-serve.pid ] && ! kill -0 "$(cat /tmp/ollama-serve.pid)" 2>/dev/null; then
+            echo "ollama serve exited early; log:"
+            tail -100 /tmp/ollama-serve.log || true
+            nohup ollama serve > /tmp/ollama-serve.log 2>&1 &
+            echo $! > /tmp/ollama-serve.pid
+          fi
+          sleep 2
+        done
+
+        if [ "$ready" != "1" ]; then
+          echo "ERROR: Ollama failed to become ready" >&2
+          tail -100 /tmp/ollama-serve.log || true
           exit 1
         fi
 
-    - name: Pull model
+        curl -s "http://${OLLAMA_HOST}/api/tags" | head -c 500 || true
+        echo
+
+    - name: Pull model (with retries)
       shell: bash
       run: |
-        echo "Pulling ${{ inputs.model }} (fast when cache hit)..."
-        ollama pull "${{ inputs.model }}"
+        set -euo pipefail
+        MODEL="${{ inputs.model }}"
+        export OLLAMA_HOST="${OLLAMA_HOST:-127.0.0.1:11434}"
+
+        wait_api() {
+          for i in $(seq 1 30); do
+            if curl -sf "http://${OLLAMA_HOST}/api/tags" >/dev/null 2>&1; then
+              return 0
+            fi
+            sleep 2
+          done
+          return 1
+        }
+
+        restart_server() {
+          echo "Restarting ollama serve..."
+          pkill -f 'ollama serve' 2>/dev/null || true
+          sleep 2
+          nohup ollama serve > /tmp/ollama-serve.log 2>&1 &
+          echo $! > /tmp/ollama-serve.pid
+          wait_api
+        }
+
+        model_present() {
+          # Prefer API (avoids CLI TTY/spinner issues in CI)
+          curl -sf "http://${OLLAMA_HOST}/api/tags" \
+            | python3 -c "import sys,json; m='$MODEL'; tags=json.load(sys.stdin).get('models',[]); names=[x.get('name','') for x in tags]; sys.exit(0 if any(n==m or n.startswith(m) for n in names) else 1)" \
+            2>/dev/null
+        }
+
+        if model_present; then
+          echo "Model $MODEL already present (from cache)"
+          ollama list || true
+          exit 0
+        fi
+
+        echo "Pulling $MODEL (retries on transient 503 / network errors)..."
+        ok=0
+        for attempt in 1 2 3 4 5; do
+          echo "=== pull attempt $attempt/5 ==="
+          wait_api || restart_server || true
+
+          # CLI pull; disable spinner noise somewhat via script
+          set +e
+          ollama pull "$MODEL"
+          rc=$?
+          set -e
+          echo "ollama pull exit code: $rc"
+
+          if [ "$rc" -eq 0 ] && model_present; then
+            echo "Pull succeeded on attempt $attempt"
+            ok=1
+            break
+          fi
+
+          # Fallback: pull via HTTP API (sometimes more reliable in CI)
+          echo "Trying API pull fallback..."
+          set +e
+          curl -sf "http://${OLLAMA_HOST}/api/pull" \
+            -d "{\"name\":\"$MODEL\",\"stream\":false}" \
+            -o /tmp/ollama-pull.json
+          api_rc=$?
+          set -e
+          echo "api pull curl exit: $api_rc"
+          head -c 300 /tmp/ollama-pull.json 2>/dev/null || true
+          echo
+
+          if model_present; then
+            echo "Model present after API pull"
+            ok=1
+            break
+          fi
+
+          echo "Attempt $attempt failed; server log tail:"
+          tail -40 /tmp/ollama-serve.log || true
+          restart_server || true
+          sleep $((attempt * 3))
+        done
+
+        if [ "$ok" != "1" ]; then
+          echo "ERROR: failed to pull model $MODEL after retries" >&2
+          tail -100 /tmp/ollama-serve.log || true
+          exit 1
+        fi
+
         echo "Models available:"
-        ollama list
+        ollama list || curl -s "http://${OLLAMA_HOST}/api/tags"
