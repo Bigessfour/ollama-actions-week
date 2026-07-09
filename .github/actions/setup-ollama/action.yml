@@ -1,0 +1,69 @@
+name: 'Setup Ollama with cache'
+description: 'Restore Ollama model cache, install Ollama, start the service, and pull the requested model'
+
+inputs:
+  model:
+    description: 'Ollama model tag to pull (e.g. llama3.2:1b)'
+    required: true
+
+outputs:
+  cache-hit:
+    description: 'true if the primary cache key was restored'
+    value: ${{ steps.cache.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Cache Ollama models
+      id: cache
+      uses: actions/cache@v4
+      with:
+        # Model blobs + manifests live here. Binary still installs each job
+        # (small); model layers are the multi-GB cost we avoid.
+        path: ~/.ollama
+        key: ollama-${{ runner.os }}-${{ inputs.model }}-v1
+        restore-keys: |
+          ollama-${{ runner.os }}-${{ inputs.model }}-
+          ollama-${{ runner.os }}-
+
+    - name: Install Ollama
+      shell: bash
+      run: |
+        if command -v ollama >/dev/null 2>&1; then
+          echo "Ollama already on PATH: $(command -v ollama)"
+          ollama --version || true
+        else
+          echo "Installing Ollama..."
+          curl -fsSL https://ollama.com/install.sh | sh
+        fi
+
+    - name: Start Ollama service
+      shell: bash
+      run: |
+        mkdir -p "$HOME/.ollama"
+        echo "Cache hit: ${{ steps.cache.outputs.cache-hit }}"
+        if curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+          echo "Ollama already serving"
+        else
+          ollama serve >/tmp/ollama-serve.log 2>&1 &
+          for i in $(seq 1 45); do
+            if curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+              echo "Ollama ready (attempt $i)"
+              break
+            fi
+            sleep 2
+          done
+        fi
+        if ! curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+          echo "ERROR: Ollama failed to start" >&2
+          tail -50 /tmp/ollama-serve.log 2>/dev/null || true
+          exit 1
+        fi
+
+    - name: Pull model
+      shell: bash
+      run: |
+        echo "Pulling ${{ inputs.model }} (fast when cache hit)..."
+        ollama pull "${{ inputs.model }}"
+        echo "Models available:"
+        ollama list

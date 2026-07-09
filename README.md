@@ -29,6 +29,12 @@
 5. **matrix-analysis** — Models × prompt styles (`concise` / `detailed` / `technical`), `fail-fast: false`  
 6. **matrix-compare** — Downloads matrix artifacts and writes a comparison summary  
 
+### Caching
+
+AI jobs use the composite action `.github/actions/setup-ollama`, which caches `~/.ollama` via `actions/cache@v4` keyed by OS + model (`llama3.2:1b` / `llama3.2:3b`). After the first warm run, `ollama pull` is effectively a no-op and jobs skip multi-GB downloads.
+
+Day 1 workflows (`push` / `pr` / `scheduled`) have no large dependencies, so they do not use this cache.
+
 ### Model choices
 
 | Model | Why |
