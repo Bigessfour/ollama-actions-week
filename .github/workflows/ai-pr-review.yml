@@ -1,0 +1,843 @@
+# AI-Powered Pull Request Documentation Review
+# Week 11 Day 2 — Ollama + GitHub Actions
+# Parts 1–8: basic AI review, personal files, env config, multi-job
+# pipeline, conditionals, matrix models/prompts, PR comments, dashboard
+
+name: AI PR Documentation Review
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+# Part 3: workflow-level AI configuration
+env:
+  AI_MODEL: llama3.2:1b
+  AI_TEMPERATURE: "0.3"
+  MAX_TOKENS: "512"
+  ANALYSIS_TYPE: documentation
+
+jobs:
+  # ============================================================
+  # Part 4 Job 1: Setup — install Ollama, pull model, verify
+  # ============================================================
+  setup:
+    name: Setup Ollama
+    runs-on: ubuntu-latest
+    outputs:
+      model_version: ${{ steps.verify.outputs.model_version }}
+      disk_space: ${{ steps.verify.outputs.disk_space }}
+      ready: ${{ steps.verify.outputs.ready }}
+    steps:
+      - name: Log pipeline stage
+        run: echo "=== PIPELINE STAGE: SETUP ==="
+
+      - uses: actions/checkout@v4
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama service
+        run: |
+          ollama serve &
+          # Wait until the API is accepting requests
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+              echo "Ollama is ready"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Pull model
+        run: ollama pull "${{ env.AI_MODEL }}"
+
+      - name: Verify Ollama readiness
+        id: verify
+        run: |
+          echo "=== AI Configuration (pre-analysis) ==="
+          echo "AI_MODEL=${{ env.AI_MODEL }}"
+          echo "AI_TEMPERATURE=${{ env.AI_TEMPERATURE }}"
+          echo "MAX_TOKENS=${{ env.MAX_TOKENS }}"
+          echo "ANALYSIS_TYPE=${{ env.ANALYSIS_TYPE }}"
+
+          MODEL_VERSION=$(ollama list | grep -F "${{ env.AI_MODEL }}" | head -1 || echo "unknown")
+          DISK_SPACE=$(df -h / | awk 'NR==2 {print $4}')
+          echo "Model version line: $MODEL_VERSION"
+          echo "Available disk space: $DISK_SPACE"
+          echo "model_version=$MODEL_VERSION" >> "$GITHUB_OUTPUT"
+          echo "disk_space=$DISK_SPACE" >> "$GITHUB_OUTPUT"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+          # Smoke-test the model
+          ollama run "${{ env.AI_MODEL }}" "Reply with exactly: OK" || true
+
+  # ============================================================
+  # Part 4 Job 2 + Parts 1,2,3,5: Analysis
+  # ============================================================
+  analysis:
+    name: AI Analysis
+    needs: setup
+    runs-on: ubuntu-latest
+    # Part 3: job-level prompt style
+    env:
+      PROMPT_STYLE: technical
+    outputs:
+      quality_rating: ${{ steps.quality.outputs.rating }}
+      analysis_file: ${{ steps.save.outputs.filename }}
+    steps:
+      - name: Log pipeline stage
+        run: echo "=== PIPELINE STAGE: ANALYSIS ==="
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Display AI configuration
+        run: |
+          echo "=== AI Configuration ==="
+          echo "AI_MODEL=${{ env.AI_MODEL }}"
+          echo "AI_TEMPERATURE=${{ env.AI_TEMPERATURE }}"
+          echo "MAX_TOKENS=${{ env.MAX_TOKENS }}"
+          echo "ANALYSIS_TYPE=${{ env.ANALYSIS_TYPE }}"
+          echo "PROMPT_STYLE=${{ env.PROMPT_STYLE }}"
+          echo "PR_NUMBER=${{ github.event.pull_request.number }}"
+          echo "PR_TITLE=${{ github.event.pull_request.title }}"
+          echo "PR_AUTHOR=${{ github.event.pull_request.user.login }}"
+          echo "SOURCE_BRANCH=${{ github.head_ref }}"
+          echo "SETUP_MODEL=${{ needs.setup.outputs.model_version }}"
+          echo "SETUP_DISK=${{ needs.setup.outputs.disk_space }}"
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama service
+        run: |
+          ollama serve &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
+              echo "Ollama is ready"
+              break
+            fi
+            sleep 2
+          done
+
+      - name: Pull model
+        run: ollama pull "${{ env.AI_MODEL }}"
+
+      - name: Detect changed files
+        id: changes
+        run: |
+          # Part 5: file-change-based analysis selection
+          BASE="${{ github.event.pull_request.base.sha }}"
+          HEAD="${{ github.event.pull_request.head.sha }}"
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD" 2>/dev/null || git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          if echo "$CHANGED" | grep -qE 'README\.md'; then
+            echo "readme_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "readme_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if echo "$CHANGED" | grep -qE '\.ya?ml$'; then
+            echo "yml_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "yml_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          if echo "$CHANGED" | grep -qE '\.txt$'; then
+            echo "txt_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "txt_changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Branch-based prompt selection (Part 5)
+          BRANCH="${{ github.head_ref }}"
+          if [[ "$BRANCH" == docs/* ]]; then
+            echo "branch_prompt=documentation" >> "$GITHUB_OUTPUT"
+          elif [[ "$BRANCH" == feature/* ]]; then
+            echo "branch_prompt=feature" >> "$GITHUB_OUTPUT"
+          else
+            echo "branch_prompt=general" >> "$GITHUB_OUTPUT"
+          fi
+          echo "branch=$BRANCH"
+
+      - name: Create analysis directory
+        run: mkdir -p analysis
+
+      - name: Read personal files (Part 2)
+        id: personal
+        run: |
+          if [ -f name.txt ] && [ -s name.txt ]; then
+            NAME_CONTENT=$(cat name.txt)
+            echo "name_present=true" >> "$GITHUB_OUTPUT"
+          else
+            NAME_CONTENT="[name.txt missing or empty]"
+            echo "name_present=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -f devops.txt ] && [ -s devops.txt ]; then
+            DEVOPS_CONTENT=$(cat devops.txt)
+            echo "devops_present=true" >> "$GITHUB_OUTPUT"
+          else
+            DEVOPS_CONTENT="[devops.txt missing or empty]"
+            echo "devops_present=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Multiline-safe for later steps via files
+          printf '%s' "$NAME_CONTENT" > /tmp/name_content.txt
+          printf '%s' "$DEVOPS_CONTENT" > /tmp/devops_content.txt
+          echo "Personal files loaded"
+
+      - name: Run AI analyses
+        id: ai
+        continue-on-error: true
+        run: |
+          set +e
+          MODEL="${{ env.AI_MODEL }}"
+          TEMP="${{ env.AI_TEMPERATURE }}"
+          STYLE="${{ env.PROMPT_STYLE }}"
+          BRANCH_PROMPT="${{ steps.changes.outputs.branch_prompt }}"
+          TIMESTAMP=$(date -u +"%Y%m%dT%H%M%SZ")
+          PR_NUM="${{ github.event.pull_request.number }}"
+
+          run_ollama() {
+            local prompt="$1"
+            local outfile="$2"
+            # Use generate API for reliable non-interactive capture
+            RESPONSE=$(curl -s http://127.0.0.1:11434/api/generate \
+              -d "$(jq -n \
+                --arg model "$MODEL" \
+                --arg prompt "$prompt" \
+                --argjson temp "${TEMP}" \
+                '{model:$model, prompt:$prompt, stream:false, options:{temperature:$temp}}')" \
+              | jq -r '.response // empty')
+            if [ -z "$RESPONSE" ]; then
+              # Fallback to CLI
+              RESPONSE=$(ollama run "$MODEL" "$prompt" 2>/dev/null)
+            fi
+            if [ -z "$RESPONSE" ]; then
+              echo "AI_ERROR: empty response" > "$outfile"
+              return 1
+            fi
+            printf '%s\n' "$RESPONSE" > "$outfile"
+            return 0
+          }
+
+          # --- Part 5: choose primary prompt based on file changes ---
+          if [ "${{ steps.changes.outputs.readme_changed }}" = "true" ]; then
+            PRIMARY_FOCUS="documentation review of README.md"
+          elif [ "${{ steps.changes.outputs.yml_changed }}" = "true" ]; then
+            PRIMARY_FOCUS="workflow/configuration review of changed YAML files"
+          elif [ "${{ steps.changes.outputs.txt_changed }}" = "true" ]; then
+            PRIMARY_FOCUS="content review of changed text files"
+          else
+            PRIMARY_FOCUS="general repository assessment"
+          fi
+
+          # Branch-based framing
+          case "$BRANCH_PROMPT" in
+            documentation) BRANCH_FRAME="This is a documentation-focused PR. Emphasize clarity, completeness, and onboarding value." ;;
+            feature)       BRANCH_FRAME="This is a feature PR. Emphasize impact on developers and integration risk." ;;
+            *)             BRANCH_FRAME="This is a general PR. Provide balanced technical feedback." ;;
+          esac
+
+          README_CONTENT=""
+          if [ -f README.md ]; then
+            README_CONTENT=$(cat README.md)
+          else
+            README_CONTENT="[README.md not found]"
+          fi
+
+          # Part 1 + Part 4: README documentation quality
+          README_PROMPT="You are a ${STYLE} technical writer reviewing documentation.
+Context: ${BRANCH_FRAME}
+Primary focus: ${PRIMARY_FOCUS}
+Temperature guidance: ${TEMP}. Keep response under ~${{ env.MAX_TOKENS }} tokens.
+
+Analyze this README.md for documentation quality.
+You MUST include:
+1) Clarity assessment
+2) Missing sections identification
+3) Improvement suggestions
+4) Quality rating exactly as one of: Excellent / Good / Needs Improvement / Poor
+
+README content:
+${README_CONTENT}"
+
+          run_ollama "$README_PROMPT" analysis/readme-quality.txt
+          AI_OK=$?
+
+          # Part 4: repository structure assessment
+          STRUCTURE=$(find . -type f \
+            -not -path './.git/*' \
+            -not -path './analysis/*' \
+            | sort | head -100)
+          STRUCT_PROMPT="You are a ${STYLE} DevOps engineer. Assess this repository structure. List what files exist, what looks complete, and what is missing for a solid GitHub Actions + Ollama project. Be concise.
+
+Repository files:
+${STRUCTURE}"
+          run_ollama "$STRUCT_PROMPT" analysis/structure-assessment.txt
+
+          # Part 4: suggested improvements
+          IMPROVE_PROMPT="Based on this repository structure and README, list the top concrete improvements for CI/CD and documentation. Use a checklist format.
+
+Structure:
+${STRUCTURE}
+
+README:
+${README_CONTENT}"
+          run_ollama "$IMPROVE_PROMPT" analysis/suggested-improvements.txt
+
+          # Part 2: personalized analysis of name.txt + devops.txt
+          NAME_CONTENT=$(cat /tmp/name_content.txt)
+          DEVOPS_CONTENT=$(cat /tmp/devops_content.txt)
+          PERSONAL_PROMPT="You are a career coach helping a DevOps engineer prepare for interviews.
+Evaluate the DevOps motivation statement for clarity and conviction.
+Suggest how to strengthen it for a job interview.
+Identify any technical terms that could be expanded upon.
+
+Student name: ${NAME_CONTENT}
+DevOps statement: ${DEVOPS_CONTENT}
+
+If either field notes missing content, analyze whatever documentation is present instead."
+          run_ollama "$PERSONAL_PROMPT" analysis/personal-feedback.txt
+
+          # Combined personal report (Part 2)
+          {
+            echo "# Combined Personal Analysis Report"
+            echo ""
+            echo "## Original Content"
+            echo "### name.txt"
+            echo "$NAME_CONTENT"
+            echo ""
+            echo "### devops.txt"
+            echo "$DEVOPS_CONTENT"
+            echo ""
+            echo "## AI Analysis of DevOps Statement"
+            cat analysis/personal-feedback.txt
+            echo ""
+            echo "## Metadata"
+            echo "- Timestamp (UTC): $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            echo "- Model: $MODEL"
+            echo "- Prompt style: $STYLE"
+            echo "- Analysis type: ${{ env.ANALYSIS_TYPE }}"
+            echo "- Temperature: $TEMP"
+            echo "- Max tokens guidance: ${{ env.MAX_TOKENS }}"
+            echo "- PR #${PR_NUM}: ${{ github.event.pull_request.title }}"
+            echo "- Author: ${{ github.event.pull_request.user.login }}"
+            echo "- Branch: ${{ github.head_ref }}"
+          } > "analysis/personal-combined-${PR_NUM}-${TIMESTAMP}.txt"
+
+          # Master analysis file with PR number + timestamp (Part 1)
+          MASTER="analysis/readme-review-pr${PR_NUM}-${TIMESTAMP}.txt"
+          {
+            echo "# AI README Documentation Review"
+            echo ""
+            echo "## PR Context"
+            echo "- PR Number: ${PR_NUM}"
+            echo "- PR Title: ${{ github.event.pull_request.title }}"
+            echo "- Author: ${{ github.event.pull_request.user.login }}"
+            echo "- Source Branch: ${{ github.head_ref }}"
+            echo "- Primary focus: ${PRIMARY_FOCUS}"
+            echo "- Branch prompt mode: ${BRANCH_PROMPT}"
+            echo "- Timestamp (UTC): $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            echo "- Model: $MODEL"
+            echo "- Temperature: $TEMP"
+            echo "- Prompt style: $STYLE"
+            echo ""
+            echo "## README Quality Analysis"
+            cat analysis/readme-quality.txt
+            echo ""
+            echo "## Repository Structure Assessment"
+            cat analysis/structure-assessment.txt
+            echo ""
+            echo "## Suggested Improvements"
+            cat analysis/suggested-improvements.txt
+          } > "$MASTER"
+
+          echo "master_file=$MASTER" >> "$GITHUB_ENV"
+          echo "ai_ok=$AI_OK" >> "$GITHUB_ENV"
+          ls -la analysis/
+
+      - name: Failure recovery fallback (Part 5)
+        if: steps.ai.outcome == 'failure' || env.ai_ok == '1'
+        run: |
+          echo "AI analysis had failures — applying fallback file existence checks"
+          {
+            echo "# Fallback Analysis (AI failure recovery)"
+            echo "Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            echo "Reason: AI analysis step reported failure or empty responses"
+            echo ""
+            echo "## Basic file existence checks"
+            for f in README.md name.txt devops.txt; do
+              if [ -f "$f" ]; then
+                echo "- $f: PRESENT ($(wc -c < "$f") bytes)"
+              else
+                echo "- $f: MISSING"
+              fi
+            done
+            echo ""
+            echo "## Partial AI outputs (if any)"
+            ls -la analysis/ 2>/dev/null || echo "No analysis directory"
+          } > analysis/fallback-recovery.txt
+          # Ensure master file exists for downstream jobs
+          if [ ! -f "${{ env.master_file }}" ]; then
+            cp analysis/fallback-recovery.txt "analysis/readme-review-pr${{ github.event.pull_request.number }}-fallback.txt"
+            echo "master_file=analysis/readme-review-pr${{ github.event.pull_request.number }}-fallback.txt" >> "$GITHUB_ENV"
+          fi
+
+      - name: Extract quality rating (Part 5)
+        id: quality
+        run: |
+          RATING="Needs Improvement"
+          SRC="${{ env.master_file }}"
+          if [ -f analysis/readme-quality.txt ]; then
+            SRC=analysis/readme-quality.txt
+          fi
+          if grep -qiE 'Quality rating[: ]*Excellent|rating[: ]*Excellent|\bExcellent\b' "$SRC" 2>/dev/null; then
+            # Prefer explicit Excellent if present without Poor dominating
+            if grep -qiE 'Quality rating[: ]*Excellent|:\s*Excellent' "$SRC"; then
+              RATING="Excellent"
+            fi
+          fi
+          if grep -qiE 'Quality rating[: ]*Poor|:\s*Poor' "$SRC" 2>/dev/null; then
+            RATING="Poor"
+          elif grep -qiE 'Quality rating[: ]*Good|:\s*Good' "$SRC" 2>/dev/null; then
+            RATING="Good"
+          elif grep -qiE 'Quality rating[: ]*Needs Improvement|:\s*Needs Improvement' "$SRC" 2>/dev/null; then
+            RATING="Needs Improvement"
+          fi
+          echo "Detected quality rating: $RATING"
+          echo "rating=$RATING" >> "$GITHUB_OUTPUT"
+          echo "QUALITY_RATING=$RATING" >> "$GITHUB_ENV"
+
+      - name: Detailed follow-up for Poor quality (Part 5)
+        if: steps.quality.outputs.rating == 'Poor'
+        continue-on-error: true
+        run: |
+          echo "Quality rated Poor — running additional detailed analysis"
+          PROMPT="The previous review rated documentation as Poor. Provide a detailed, step-by-step remediation plan with prioritized fixes for README.md and repo docs."
+          CONTENT=$(cat README.md 2>/dev/null || echo "missing")
+          curl -s http://127.0.0.1:11434/api/generate \
+            -d "$(jq -n --arg m "${{ env.AI_MODEL }}" --arg p "$PROMPT Content: $CONTENT" '{model:$m, prompt:$p, stream:false}')" \
+            | jq -r '.response // "detailed analysis unavailable"' \
+            > analysis/detailed-poor-followup.txt
+
+      - name: Skip detailed analysis for Excellent (Part 5)
+        if: steps.quality.outputs.rating == 'Excellent'
+        run: echo "Quality rated Excellent — skipping detailed follow-up analysis. Success logged."
+
+      - name: Record master filename
+        id: save
+        run: |
+          F="${{ env.master_file }}"
+          if [ -z "$F" ] || [ ! -f "$F" ]; then
+            F=$(ls analysis/readme-review-pr*.txt 2>/dev/null | head -1)
+          fi
+          echo "filename=$F" >> "$GITHUB_OUTPUT"
+          echo "Master analysis file: $F"
+          ls -la analysis/
+
+      - name: Upload analysis artifacts (90-day retention)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-analysis-pr-${{ github.event.pull_request.number }}
+          path: analysis/
+          retention-days: 90
+
+  # ============================================================
+  # Part 4 Job 3: Synthesis — executive summary from analyses
+  # ============================================================
+  synthesis:
+    name: AI Synthesis
+    needs: analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log pipeline stage
+        run: echo "=== PIPELINE STAGE: SYNTHESIS ==="
+
+      - uses: actions/checkout@v4
+
+      - name: Download analysis artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-analysis-pr-${{ github.event.pull_request.number }}
+          path: analysis
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama and pull model
+        run: |
+          ollama serve &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          ollama pull "${{ env.AI_MODEL }}"
+
+      - name: Generate executive summary
+        continue-on-error: true
+        run: |
+          mkdir -p analysis
+          COMBINED=$(cat analysis/readme-quality.txt analysis/structure-assessment.txt analysis/suggested-improvements.txt 2>/dev/null | head -c 8000)
+          PROMPT="Read the following three analysis sections and produce:
+1) A combined executive summary (3-5 sentences)
+2) A single overall quality score: Excellent / Good / Needs Improvement / Poor
+3) The top 3 priority improvements as a numbered list
+
+Analyses:
+${COMBINED}"
+          RESPONSE=$(curl -s http://127.0.0.1:11434/api/generate \
+            -d "$(jq -n --arg m "${{ env.AI_MODEL }}" --arg p "$PROMPT" '{model:$m, prompt:$p, stream:false}')" \
+            | jq -r '.response // empty')
+          if [ -z "$RESPONSE" ]; then
+            RESPONSE=$(ollama run "${{ env.AI_MODEL }}" "$PROMPT" 2>/dev/null || echo "Synthesis unavailable")
+          fi
+          {
+            echo "# Executive Summary"
+            echo ""
+            echo "- PR: #${{ github.event.pull_request.number }} — ${{ github.event.pull_request.title }}"
+            echo "- Author: ${{ github.event.pull_request.user.login }}"
+            echo "- Branch: ${{ github.head_ref }}"
+            echo "- Model: ${{ env.AI_MODEL }}"
+            echo "- Prior quality signal: ${{ needs.analysis.outputs.quality_rating }}"
+            echo "- Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            echo ""
+            echo "$RESPONSE"
+          } > analysis/executive-summary.txt
+          cat analysis/executive-summary.txt
+
+      - name: Upload synthesis artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-synthesis-pr-${{ github.event.pull_request.number }}
+          path: analysis/executive-summary.txt
+          retention-days: 90
+
+  # ============================================================
+  # Part 4 Job 4 + Parts 7 & 8: Report, PR comment, dashboard
+  # ============================================================
+  report:
+    name: Report & PR Comment
+    needs: [analysis, synthesis]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log pipeline stage
+        run: echo "=== PIPELINE STAGE: REPORT ==="
+
+      - uses: actions/checkout@v4
+
+      - name: Download analysis artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-analysis-pr-${{ github.event.pull_request.number }}
+          path: analysis
+
+      - name: Download synthesis artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-synthesis-pr-${{ github.event.pull_request.number }}
+          path: synthesis
+
+      - name: Display executive summary
+        run: |
+          echo "=== FINAL WORKFLOW OUTPUT ==="
+          cat synthesis/executive-summary.txt || echo "(no executive summary)"
+
+      - name: Format and post AI PR comment (Part 7)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RATING="${{ needs.analysis.outputs.quality_rating }}"
+          case "$RATING" in
+            Excellent) BADGE="✅ Excellent" ;;
+            Good) BADGE="🟢 Good" ;;
+            Poor) BADGE="❌ Poor" ;;
+            *) BADGE="⚠️ Needs Improvement" ;;
+          esac
+
+          TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          README_SNIP=$(head -c 2500 analysis/readme-quality.txt 2>/dev/null || echo "See artifacts")
+          EXEC_SNIP=$(head -c 2000 synthesis/executive-summary.txt 2>/dev/null || echo "See artifacts")
+          IMPROVE=$(head -c 1500 analysis/suggested-improvements.txt 2>/dev/null || echo "- Review documentation completeness")
+
+          # Build checklist-style suggestions
+          {
+            echo "## 🤖 Automated AI Documentation Review"
+            echo ""
+            echo "**Quality:** $BADGE"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Model | \`${{ env.AI_MODEL }}\` |"
+            echo "| Timestamp (UTC) | $TS |"
+            echo "| PR | #${{ github.event.pull_request.number }} |"
+            echo "| Branch | \`${{ github.head_ref }}\` |"
+            echo "| Author | @${{ github.event.pull_request.user.login }} |"
+            echo "| Analysis type | ${{ env.ANALYSIS_TYPE }} |"
+            echo "| Run | [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) |"
+            echo ""
+            echo "### Executive Summary"
+            echo ""
+            echo '```'
+            echo "$EXEC_SNIP"
+            echo '```'
+            echo ""
+            echo "### README Findings"
+            echo ""
+            echo '```'
+            echo "$README_SNIP"
+            echo '```'
+            echo ""
+            echo "### Suggested Actions"
+            echo ""
+            echo "$IMPROVE" | sed 's/^/- [ ] /' | head -20
+            echo ""
+            echo "---"
+            echo "*Generated by Ollama \`${{ env.AI_MODEL }}\` · Updated Analysis · $(date -u)*"
+            echo ""
+            echo "Full reports are available as workflow artifacts (\`ai-analysis-pr-${{ github.event.pull_request.number }}\`)."
+          } > /tmp/pr-comment.md
+
+          # Prefer editing last bot comment when present; otherwise create new
+          if gh pr view "${{ github.event.pull_request.number }}" --comments --json comments \
+            --jq '.comments[].author.login' 2>/dev/null | grep -qi 'github-actions'; then
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/pr-comment.md --edit-last \
+              || gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/pr-comment.md
+          else
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/pr-comment.md
+          fi
+
+          # Part 7: separate critical-issues comment if Poor
+          if [ "$RATING" = "Poor" ]; then
+            {
+              echo "## 🚨 Critical Documentation Issues"
+              echo ""
+              echo "AI quality rating is **Poor**. These are blockers for merge readiness:"
+              echo ""
+              echo "> Documentation quality is below the acceptable threshold."
+              echo ""
+              echo '```'
+              head -c 1500 analysis/readme-quality.txt 2>/dev/null || true
+              echo '```'
+              echo ""
+              echo "Please address the issues above before requesting final review."
+            } > /tmp/critical.md
+            gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/critical.md
+          fi
+
+      - name: Write AI Analysis Dashboard (Part 8)
+        run: |
+          RATING="${{ needs.analysis.outputs.quality_rating }}"
+          case "$RATING" in
+            Excellent) EMOJI="✅ Excellent"; STATUS="✅ Passing quality threshold" ;;
+            Good) EMOJI="🟢 Good"; STATUS="✅ Passing quality threshold" ;;
+            Poor) EMOJI="❌ Poor"; STATUS="❌ Critical issues found" ;;
+            *) EMOJI="⚠️ Needs Improvement"; STATUS="⚠️ Suggestions available" ;;
+          esac
+
+          ONE_LINER=$(head -3 synthesis/executive-summary.txt 2>/dev/null | tr '\n' ' ' | head -c 240)
+          ARTIFACT_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          {
+            echo "## 🤖 AI Analysis Dashboard"
+            echo ""
+            echo "### Executive Summary"
+            echo ""
+            echo "**Overall quality:** $EMOJI"
+            echo ""
+            echo "> ${ONE_LINER:-AI analysis complete — see artifacts for full detail.}"
+            echo ""
+            echo "📦 [Download full analysis artifacts](${ARTIFACT_URL})"
+            echo ""
+            echo "### Status"
+            echo ""
+            echo "$STATUS"
+            echo ""
+            echo "### Detailed Findings"
+            echo ""
+            echo "| File | Quality score | Key finding | Suggested action |"
+            echo "|------|---------------|-------------|------------------|"
+            echo "| README.md | $RATING | Documentation review completed by Ollama | Address checklist items in PR comment |"
+            echo "| name.txt / devops.txt | Reviewed | Personalized DevOps statement feedback generated | Strengthen interview narrative |"
+            echo "| Repository structure | Assessed | Structure analysis artifact available | Prioritize top 3 improvements |"
+            echo ""
+            echo "### Configuration Transparency"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---------|-------|"
+            echo "| Model | \`${{ env.AI_MODEL }}\` |"
+            echo "| Temperature | ${{ env.AI_TEMPERATURE }} |"
+            echo "| Max tokens guidance | ${{ env.MAX_TOKENS }} |"
+            echo "| Analysis type | ${{ env.ANALYSIS_TYPE }} |"
+            echo "| Prompt style | technical |"
+            echo "| Timestamp (UTC) | $(date -u +"%Y-%m-%dT%H:%M:%SZ") |"
+            echo "| Workflow run | #${{ github.run_number }} |"
+            echo "| Run ID | ${{ github.run_id }} |"
+            echo ""
+            echo "### Historical Tracking"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| PR number | #${{ github.event.pull_request.number }} |"
+            echo "| Branch | \`${{ github.head_ref }}\` |"
+            echo "| Triggered by | @${{ github.event.pull_request.user.login }} |"
+            echo "| Actor | @${{ github.actor }} |"
+            echo "| Compare runs | [Actions runs](${{ github.server_url }}/${{ github.repository }}/actions/workflows/ai-pr-review.yml) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ============================================================
+  # Part 6: Matrix AI testing across models and prompt styles
+  # ============================================================
+  matrix-analysis:
+    name: Matrix AI (${{ matrix.model }} / ${{ matrix.prompt_style }})
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # llama3.2:1b = fast/lightweight; llama3.2:3b = more capable when RAM allows
+        model: [llama3.2:1b, llama3.2:3b]
+        prompt_style: [concise, detailed, technical]
+    steps:
+      - name: Print matrix combination
+        run: |
+          echo "=== MATRIX CELL ==="
+          echo "Model: ${{ matrix.model }}"
+          echo "Prompt style: ${{ matrix.prompt_style }}"
+          echo "START_TIME=$(date +%s)" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v4
+
+      - name: Install Ollama
+        run: curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama and pull matrix model
+        run: |
+          ollama serve &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          ollama pull "${{ matrix.model }}"
+
+      - name: Run matrix analysis
+        continue-on-error: true
+        run: |
+          STYLE="${{ matrix.prompt_style }}"
+          MODEL="${{ matrix.model }}"
+          # Sanitize model name for filenames: llama3.2:1b -> llama3.2-1b
+          MODEL_SAFE=$(echo "$MODEL" | tr ':/' '-')
+          OUTFILE="analysis-${MODEL_SAFE}-${STYLE}.txt"
+
+          case "$STYLE" in
+            concise)
+              INSTR="Provide brief bullet-point feedback only. Max 8 bullets."
+              ;;
+            detailed)
+              INSTR="Provide comprehensive analysis with examples and rationale."
+              ;;
+            technical)
+              INSTR="Provide developer-focused feedback with concrete code/workflow suggestions."
+              ;;
+          esac
+
+          CONTENT=$(cat README.md 2>/dev/null || echo "No README")
+          PROMPT="${INSTR}
+Analyze this README for documentation quality. Include a quality rating (Excellent/Good/Needs Improvement/Poor).
+
+README:
+${CONTENT}"
+
+          START=$(date +%s)
+          RESPONSE=$(curl -s http://127.0.0.1:11434/api/generate \
+            -d "$(jq -n --arg m "$MODEL" --arg p "$PROMPT" '{model:$m, prompt:$p, stream:false}')" \
+            | jq -r '.response // empty')
+          if [ -z "$RESPONSE" ]; then
+            RESPONSE=$(ollama run "$MODEL" "$PROMPT" 2>/dev/null || echo "Matrix analysis failed for $MODEL / $STYLE")
+          fi
+          END=$(date +%s)
+          DURATION=$((END - START))
+
+          {
+            echo "# Matrix Analysis"
+            echo "Model: $MODEL"
+            echo "Prompt style: $STYLE"
+            echo "Duration seconds: $DURATION"
+            echo "Timestamp UTC: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            echo "PR: #${{ github.event.pull_request.number }}"
+            echo ""
+            echo "$RESPONSE"
+          } > "$OUTFILE"
+
+          echo "Wrote $OUTFILE in ${DURATION}s"
+          cat "$OUTFILE" | head -40
+
+      - name: Upload matrix cell artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-${{ strategy.job-index }}-${{ matrix.prompt_style }}
+          path: analysis-*.txt
+          retention-days: 90
+          if-no-files-found: warn
+
+  # ============================================================
+  # Part 6: Comparison job after matrix completes
+  # ============================================================
+  matrix-compare:
+    name: Matrix Comparison
+    needs: matrix-analysis
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Download all matrix artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: matrix-*
+          path: matrix-results
+          merge-multiple: true
+
+      - name: Compare matrix results
+        run: |
+          echo "=== Matrix combination outputs ==="
+          find matrix-results -type f -name 'analysis-*.txt' | sort
+          echo ""
+          {
+            echo "# Matrix Comparison Summary"
+            echo "Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+            echo "PR: #${{ github.event.pull_request.number }}"
+            echo ""
+            echo "## Files generated"
+            find matrix-results -type f -name 'analysis-*.txt' | sort | while read -r f; do
+              BYTES=$(wc -c < "$f")
+              DURATION=$(grep -E '^Duration seconds:' "$f" | head -1 || echo "Duration seconds: n/a")
+              MODEL=$(grep -E '^Model:' "$f" | head -1 || echo "Model: n/a")
+              STYLE=$(grep -E '^Prompt style:' "$f" | head -1 || echo "Prompt style: n/a")
+              echo "- $(basename "$f") ($BYTES bytes) | $MODEL | $STYLE | $DURATION"
+            done
+            echo ""
+            echo "## Actionability heuristic"
+            echo "Larger detailed/technical outputs from larger models typically yield more actionable feedback."
+            BEST=$(find matrix-results -type f -name 'analysis-*.txt' -exec wc -c {} + 2>/dev/null | sort -n | tail -2 | head -1)
+            echo "Largest analysis candidate: $BEST"
+            echo ""
+            echo "Models tested: llama3.2:1b (fast/lightweight), llama3.2:3b (more capable)."
+            echo "Prompt styles: concise, detailed, technical."
+          } | tee comparison-summary.txt
+
+          echo "## Matrix Comparison" >> "$GITHUB_STEP_SUMMARY"
+          cat comparison-summary.txt >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload comparison summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: matrix-comparison-pr-${{ github.event.pull_request.number }}
+          path: comparison-summary.txt
+          retention-days: 90
