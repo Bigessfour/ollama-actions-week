@@ -35,17 +35,18 @@ jobs:
       ready: ${{ steps.verify.outputs.ready }}
     steps:
       - name: Log pipeline stage
-        run: echo "=== PIPELINE STAGE: SETUP ==="
+        run: |
+          echo "=== PIPELINE STAGE - SETUP ==="
 
       - uses: actions/checkout@v4
 
       - name: Install Ollama
-        run: curl -fsSL https://ollama.com/install.sh | sh
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
 
       - name: Start Ollama service
         run: |
           ollama serve &
-          # Wait until the API is accepting requests
           for i in $(seq 1 30); do
             if curl -sf http://127.0.0.1:11434/api/tags >/dev/null 2>&1; then
               echo "Ollama is ready"
@@ -55,7 +56,8 @@ jobs:
           done
 
       - name: Pull model
-        run: ollama pull "${{ env.AI_MODEL }}"
+        run: |
+          ollama pull "${{ env.AI_MODEL }}"
 
       - name: Verify Ollama readiness
         id: verify
@@ -74,7 +76,6 @@ jobs:
           echo "disk_space=$DISK_SPACE" >> "$GITHUB_OUTPUT"
           echo "ready=true" >> "$GITHUB_OUTPUT"
 
-          # Smoke-test the model
           ollama run "${{ env.AI_MODEL }}" "Reply with exactly: OK" || true
 
   # ============================================================
@@ -84,7 +85,6 @@ jobs:
     name: AI Analysis
     needs: setup
     runs-on: ubuntu-latest
-    # Part 3: job-level prompt style
     env:
       PROMPT_STYLE: technical
     outputs:
@@ -92,7 +92,8 @@ jobs:
       analysis_file: ${{ steps.save.outputs.filename }}
     steps:
       - name: Log pipeline stage
-        run: echo "=== PIPELINE STAGE: ANALYSIS ==="
+        run: |
+          echo "=== PIPELINE STAGE - ANALYSIS ==="
 
       - uses: actions/checkout@v4
         with:
@@ -114,7 +115,8 @@ jobs:
           echo "SETUP_DISK=${{ needs.setup.outputs.disk_space }}"
 
       - name: Install Ollama
-        run: curl -fsSL https://ollama.com/install.sh | sh
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
 
       - name: Start Ollama service
         run: |
@@ -128,7 +130,8 @@ jobs:
           done
 
       - name: Pull model
-        run: ollama pull "${{ env.AI_MODEL }}"
+        run: |
+          ollama pull "${{ env.AI_MODEL }}"
 
       - name: Detect changed files
         id: changes
@@ -170,28 +173,26 @@ jobs:
           echo "branch=$BRANCH"
 
       - name: Create analysis directory
-        run: mkdir -p analysis
+        run: |
+          mkdir -p analysis
 
       - name: Read personal files (Part 2)
         id: personal
         run: |
           if [ -f name.txt ] && [ -s name.txt ]; then
-            NAME_CONTENT=$(cat name.txt)
+            cat name.txt > /tmp/name_content.txt
             echo "name_present=true" >> "$GITHUB_OUTPUT"
           else
-            NAME_CONTENT="[name.txt missing or empty]"
+            echo "[name.txt missing or empty]" > /tmp/name_content.txt
             echo "name_present=false" >> "$GITHUB_OUTPUT"
           fi
           if [ -f devops.txt ] && [ -s devops.txt ]; then
-            DEVOPS_CONTENT=$(cat devops.txt)
+            cat devops.txt > /tmp/devops_content.txt
             echo "devops_present=true" >> "$GITHUB_OUTPUT"
           else
-            DEVOPS_CONTENT="[devops.txt missing or empty]"
+            echo "[devops.txt missing or empty]" > /tmp/devops_content.txt
             echo "devops_present=false" >> "$GITHUB_OUTPUT"
           fi
-          # Multiline-safe for later steps via files
-          printf '%s' "$NAME_CONTENT" > /tmp/name_content.txt
-          printf '%s' "$DEVOPS_CONTENT" > /tmp/devops_content.txt
           echo "Personal files loaded"
 
       - name: Run AI analyses
@@ -209,27 +210,25 @@ jobs:
           run_ollama() {
             local prompt="$1"
             local outfile="$2"
-            # Use generate API for reliable non-interactive capture
-            RESPONSE=$(curl -s http://127.0.0.1:11434/api/generate \
-              -d "$(jq -n \
-                --arg model "$MODEL" \
-                --arg prompt "$prompt" \
-                --argjson temp "${TEMP}" \
-                '{model:$model, prompt:$prompt, stream:false, options:{temperature:$temp}}')" \
-              | jq -r '.response // empty')
-            if [ -z "$RESPONSE" ]; then
-              # Fallback to CLI
-              RESPONSE=$(ollama run "$MODEL" "$prompt" 2>/dev/null)
+            local payload response
+            payload=$(jq -n \
+              --arg model "$MODEL" \
+              --arg prompt "$prompt" \
+              --argjson temp "${TEMP}" \
+              '{model:$model, prompt:$prompt, stream:false, options:{temperature:$temp}}')
+            response=$(curl -s http://127.0.0.1:11434/api/generate -d "$payload" | jq -r '.response // empty')
+            if [ -z "$response" ]; then
+              response=$(ollama run "$MODEL" "$prompt" 2>/dev/null)
             fi
-            if [ -z "$RESPONSE" ]; then
+            if [ -z "$response" ]; then
               echo "AI_ERROR: empty response" > "$outfile"
               return 1
             fi
-            printf '%s\n' "$RESPONSE" > "$outfile"
+            printf '%s\n' "$response" > "$outfile"
             return 0
           }
 
-          # --- Part 5: choose primary prompt based on file changes ---
+          # Part 5: choose primary prompt based on file changes
           if [ "${{ steps.changes.outputs.readme_changed }}" = "true" ]; then
             PRIMARY_FOCUS="documentation review of README.md"
           elif [ "${{ steps.changes.outputs.yml_changed }}" = "true" ]; then
@@ -240,14 +239,12 @@ jobs:
             PRIMARY_FOCUS="general repository assessment"
           fi
 
-          # Branch-based framing
           case "$BRANCH_PROMPT" in
-            documentation) BRANCH_FRAME="This is a documentation-focused PR. Emphasize clarity, completeness, and onboarding value." ;;
-            feature)       BRANCH_FRAME="This is a feature PR. Emphasize impact on developers and integration risk." ;;
-            *)             BRANCH_FRAME="This is a general PR. Provide balanced technical feedback." ;;
+            documentation) BRANCH_FRAME="Documentation-focused PR. Emphasize clarity, completeness, and onboarding value." ;;
+            feature)       BRANCH_FRAME="Feature PR. Emphasize impact on developers and integration risk." ;;
+            *)             BRANCH_FRAME="General PR. Provide balanced technical feedback." ;;
           esac
 
-          README_CONTENT=""
           if [ -f README.md ]; then
             README_CONTENT=$(cat README.md)
           else
@@ -255,20 +252,21 @@ jobs:
           fi
 
           # Part 1 + Part 4: README documentation quality
-          README_PROMPT="You are a ${STYLE} technical writer reviewing documentation.
-Context: ${BRANCH_FRAME}
-Primary focus: ${PRIMARY_FOCUS}
-Temperature guidance: ${TEMP}. Keep response under ~${{ env.MAX_TOKENS }} tokens.
-
-Analyze this README.md for documentation quality.
-You MUST include:
-1) Clarity assessment
-2) Missing sections identification
-3) Improvement suggestions
-4) Quality rating exactly as one of: Excellent / Good / Needs Improvement / Poor
-
-README content:
-${README_CONTENT}"
+          README_PROMPT=$(printf '%s\n' \
+            "You are a ${STYLE} technical writer reviewing documentation." \
+            "Context: ${BRANCH_FRAME}" \
+            "Primary focus: ${PRIMARY_FOCUS}" \
+            "Temperature guidance: ${TEMP}. Keep response under ~${{ env.MAX_TOKENS }} tokens." \
+            "" \
+            "Analyze this README.md for documentation quality." \
+            "You MUST include:" \
+            "1) Clarity assessment" \
+            "2) Missing sections identification" \
+            "3) Improvement suggestions" \
+            "4) Quality rating exactly as one of: Excellent / Good / Needs Improvement / Poor" \
+            "" \
+            "README content:" \
+            "${README_CONTENT}")
 
           run_ollama "$README_PROMPT" analysis/readme-quality.txt
           AI_OK=$?
@@ -278,34 +276,40 @@ ${README_CONTENT}"
             -not -path './.git/*' \
             -not -path './analysis/*' \
             | sort | head -100)
-          STRUCT_PROMPT="You are a ${STYLE} DevOps engineer. Assess this repository structure. List what files exist, what looks complete, and what is missing for a solid GitHub Actions + Ollama project. Be concise.
 
-Repository files:
-${STRUCTURE}"
+          STRUCT_PROMPT=$(printf '%s\n' \
+            "You are a ${STYLE} DevOps engineer. Assess this repository structure." \
+            "List what files exist, what looks complete, and what is missing for a solid GitHub Actions + Ollama project. Be concise." \
+            "" \
+            "Repository files:" \
+            "${STRUCTURE}")
           run_ollama "$STRUCT_PROMPT" analysis/structure-assessment.txt
 
           # Part 4: suggested improvements
-          IMPROVE_PROMPT="Based on this repository structure and README, list the top concrete improvements for CI/CD and documentation. Use a checklist format.
-
-Structure:
-${STRUCTURE}
-
-README:
-${README_CONTENT}"
+          IMPROVE_PROMPT=$(printf '%s\n' \
+            "Based on this repository structure and README, list the top concrete improvements for CI/CD and documentation." \
+            "Use a checklist format." \
+            "" \
+            "Structure:" \
+            "${STRUCTURE}" \
+            "" \
+            "README:" \
+            "${README_CONTENT}")
           run_ollama "$IMPROVE_PROMPT" analysis/suggested-improvements.txt
 
           # Part 2: personalized analysis of name.txt + devops.txt
           NAME_CONTENT=$(cat /tmp/name_content.txt)
           DEVOPS_CONTENT=$(cat /tmp/devops_content.txt)
-          PERSONAL_PROMPT="You are a career coach helping a DevOps engineer prepare for interviews.
-Evaluate the DevOps motivation statement for clarity and conviction.
-Suggest how to strengthen it for a job interview.
-Identify any technical terms that could be expanded upon.
-
-Student name: ${NAME_CONTENT}
-DevOps statement: ${DEVOPS_CONTENT}
-
-If either field notes missing content, analyze whatever documentation is present instead."
+          PERSONAL_PROMPT=$(printf '%s\n' \
+            "You are a career coach helping a DevOps engineer prepare for interviews." \
+            "Evaluate the DevOps motivation statement for clarity and conviction." \
+            "Suggest how to strengthen it for a job interview." \
+            "Identify any technical terms that could be expanded upon." \
+            "" \
+            "Student name: ${NAME_CONTENT}" \
+            "DevOps statement: ${DEVOPS_CONTENT}" \
+            "" \
+            "If either field notes missing content, analyze whatever documentation is present instead.")
           run_ollama "$PERSONAL_PROMPT" analysis/personal-feedback.txt
 
           # Combined personal report (Part 2)
@@ -368,7 +372,7 @@ If either field notes missing content, analyze whatever documentation is present
       - name: Failure recovery fallback (Part 5)
         if: steps.ai.outcome == 'failure' || env.ai_ok == '1'
         run: |
-          echo "AI analysis had failures — applying fallback file existence checks"
+          echo "AI analysis had failures - applying fallback file existence checks"
           {
             echo "# Fallback Analysis (AI failure recovery)"
             echo "Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -386,8 +390,7 @@ If either field notes missing content, analyze whatever documentation is present
             echo "## Partial AI outputs (if any)"
             ls -la analysis/ 2>/dev/null || echo "No analysis directory"
           } > analysis/fallback-recovery.txt
-          # Ensure master file exists for downstream jobs
-          if [ ! -f "${{ env.master_file }}" ]; then
+          if [ -z "${{ env.master_file }}" ] || [ ! -f "${{ env.master_file }}" ]; then
             cp analysis/fallback-recovery.txt "analysis/readme-review-pr${{ github.event.pull_request.number }}-fallback.txt"
             echo "master_file=analysis/readme-review-pr${{ github.event.pull_request.number }}-fallback.txt" >> "$GITHUB_ENV"
           fi
@@ -400,13 +403,9 @@ If either field notes missing content, analyze whatever documentation is present
           if [ -f analysis/readme-quality.txt ]; then
             SRC=analysis/readme-quality.txt
           fi
-          if grep -qiE 'Quality rating[: ]*Excellent|rating[: ]*Excellent|\bExcellent\b' "$SRC" 2>/dev/null; then
-            # Prefer explicit Excellent if present without Poor dominating
-            if grep -qiE 'Quality rating[: ]*Excellent|:\s*Excellent' "$SRC"; then
-              RATING="Excellent"
-            fi
-          fi
-          if grep -qiE 'Quality rating[: ]*Poor|:\s*Poor' "$SRC" 2>/dev/null; then
+          if grep -qiE 'Quality rating[: ]*Excellent|:\s*Excellent' "$SRC" 2>/dev/null; then
+            RATING="Excellent"
+          elif grep -qiE 'Quality rating[: ]*Poor|:\s*Poor' "$SRC" 2>/dev/null; then
             RATING="Poor"
           elif grep -qiE 'Quality rating[: ]*Good|:\s*Good' "$SRC" 2>/dev/null; then
             RATING="Good"
@@ -421,17 +420,22 @@ If either field notes missing content, analyze whatever documentation is present
         if: steps.quality.outputs.rating == 'Poor'
         continue-on-error: true
         run: |
-          echo "Quality rated Poor — running additional detailed analysis"
-          PROMPT="The previous review rated documentation as Poor. Provide a detailed, step-by-step remediation plan with prioritized fixes for README.md and repo docs."
+          echo "Quality rated Poor - running additional detailed analysis"
           CONTENT=$(cat README.md 2>/dev/null || echo "missing")
-          curl -s http://127.0.0.1:11434/api/generate \
-            -d "$(jq -n --arg m "${{ env.AI_MODEL }}" --arg p "$PROMPT Content: $CONTENT" '{model:$m, prompt:$p, stream:false}')" \
+          PROMPT=$(printf '%s\n' \
+            "The previous review rated documentation as Poor." \
+            "Provide a detailed, step-by-step remediation plan with prioritized fixes for README.md and repo docs." \
+            "Content:" \
+            "$CONTENT")
+          payload=$(jq -n --arg m "${{ env.AI_MODEL }}" --arg p "$PROMPT" '{model:$m, prompt:$p, stream:false}')
+          curl -s http://127.0.0.1:11434/api/generate -d "$payload" \
             | jq -r '.response // "detailed analysis unavailable"' \
             > analysis/detailed-poor-followup.txt
 
       - name: Skip detailed analysis for Excellent (Part 5)
         if: steps.quality.outputs.rating == 'Excellent'
-        run: echo "Quality rated Excellent — skipping detailed follow-up analysis. Success logged."
+        run: |
+          echo "Quality rated Excellent - skipping detailed follow-up analysis. Success logged."
 
       - name: Record master filename
         id: save
@@ -460,7 +464,8 @@ If either field notes missing content, analyze whatever documentation is present
     runs-on: ubuntu-latest
     steps:
       - name: Log pipeline stage
-        run: echo "=== PIPELINE STAGE: SYNTHESIS ==="
+        run: |
+          echo "=== PIPELINE STAGE - SYNTHESIS ==="
 
       - uses: actions/checkout@v4
 
@@ -471,7 +476,8 @@ If either field notes missing content, analyze whatever documentation is present
           path: analysis
 
       - name: Install Ollama
-        run: curl -fsSL https://ollama.com/install.sh | sh
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
 
       - name: Start Ollama and pull model
         run: |
@@ -487,23 +493,23 @@ If either field notes missing content, analyze whatever documentation is present
         run: |
           mkdir -p analysis
           COMBINED=$(cat analysis/readme-quality.txt analysis/structure-assessment.txt analysis/suggested-improvements.txt 2>/dev/null | head -c 8000)
-          PROMPT="Read the following three analysis sections and produce:
-1) A combined executive summary (3-5 sentences)
-2) A single overall quality score: Excellent / Good / Needs Improvement / Poor
-3) The top 3 priority improvements as a numbered list
-
-Analyses:
-${COMBINED}"
-          RESPONSE=$(curl -s http://127.0.0.1:11434/api/generate \
-            -d "$(jq -n --arg m "${{ env.AI_MODEL }}" --arg p "$PROMPT" '{model:$m, prompt:$p, stream:false}')" \
-            | jq -r '.response // empty')
+          PROMPT=$(printf '%s\n' \
+            "Read the following three analysis sections and produce:" \
+            "1) A combined executive summary (3-5 sentences)" \
+            "2) A single overall quality score: Excellent / Good / Needs Improvement / Poor" \
+            "3) The top 3 priority improvements as a numbered list" \
+            "" \
+            "Analyses:" \
+            "${COMBINED}")
+          payload=$(jq -n --arg m "${{ env.AI_MODEL }}" --arg p "$PROMPT" '{model:$m, prompt:$p, stream:false}')
+          RESPONSE=$(curl -s http://127.0.0.1:11434/api/generate -d "$payload" | jq -r '.response // empty')
           if [ -z "$RESPONSE" ]; then
             RESPONSE=$(ollama run "${{ env.AI_MODEL }}" "$PROMPT" 2>/dev/null || echo "Synthesis unavailable")
           fi
           {
             echo "# Executive Summary"
             echo ""
-            echo "- PR: #${{ github.event.pull_request.number }} — ${{ github.event.pull_request.title }}"
+            echo "- PR: #${{ github.event.pull_request.number }} - ${{ github.event.pull_request.title }}"
             echo "- Author: ${{ github.event.pull_request.user.login }}"
             echo "- Branch: ${{ github.head_ref }}"
             echo "- Model: ${{ env.AI_MODEL }}"
@@ -525,12 +531,13 @@ ${COMBINED}"
   # Part 4 Job 4 + Parts 7 & 8: Report, PR comment, dashboard
   # ============================================================
   report:
-    name: Report & PR Comment
+    name: Report and PR Comment
     needs: [analysis, synthesis]
     runs-on: ubuntu-latest
     steps:
       - name: Log pipeline stage
-        run: echo "=== PIPELINE STAGE: REPORT ==="
+        run: |
+          echo "=== PIPELINE STAGE - REPORT ==="
 
       - uses: actions/checkout@v4
 
@@ -568,7 +575,6 @@ ${COMBINED}"
           EXEC_SNIP=$(head -c 2000 synthesis/executive-summary.txt 2>/dev/null || echo "See artifacts")
           IMPROVE=$(head -c 1500 analysis/suggested-improvements.txt 2>/dev/null || echo "- Review documentation completeness")
 
-          # Build checklist-style suggestions
           {
             echo "## 🤖 Automated AI Documentation Review"
             echo ""
@@ -606,7 +612,6 @@ ${COMBINED}"
             echo "Full reports are available as workflow artifacts (\`ai-analysis-pr-${{ github.event.pull_request.number }}\`)."
           } > /tmp/pr-comment.md
 
-          # Prefer editing last bot comment when present; otherwise create new
           if gh pr view "${{ github.event.pull_request.number }}" --comments --json comments \
             --jq '.comments[].author.login' 2>/dev/null | grep -qi 'github-actions'; then
             gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/pr-comment.md --edit-last \
@@ -653,7 +658,7 @@ ${COMBINED}"
             echo ""
             echo "**Overall quality:** $EMOJI"
             echo ""
-            echo "> ${ONE_LINER:-AI analysis complete — see artifacts for full detail.}"
+            echo "> ${ONE_LINER:-AI analysis complete - see artifacts for full detail.}"
             echo ""
             echo "📦 [Download full analysis artifacts](${ARTIFACT_URL})"
             echo ""
@@ -717,7 +722,8 @@ ${COMBINED}"
       - uses: actions/checkout@v4
 
       - name: Install Ollama
-        run: curl -fsSL https://ollama.com/install.sh | sh
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
 
       - name: Start Ollama and pull matrix model
         run: |
@@ -733,7 +739,6 @@ ${COMBINED}"
         run: |
           STYLE="${{ matrix.prompt_style }}"
           MODEL="${{ matrix.model }}"
-          # Sanitize model name for filenames: llama3.2:1b -> llama3.2-1b
           MODEL_SAFE=$(echo "$MODEL" | tr ':/' '-')
           OUTFILE="analysis-${MODEL_SAFE}-${STYLE}.txt"
 
@@ -750,16 +755,17 @@ ${COMBINED}"
           esac
 
           CONTENT=$(cat README.md 2>/dev/null || echo "No README")
-          PROMPT="${INSTR}
-Analyze this README for documentation quality. Include a quality rating (Excellent/Good/Needs Improvement/Poor).
-
-README:
-${CONTENT}"
+          PROMPT=$(printf '%s\n' \
+            "${INSTR}" \
+            "Analyze this README for documentation quality." \
+            "Include a quality rating (Excellent/Good/Needs Improvement/Poor)." \
+            "" \
+            "README:" \
+            "${CONTENT}")
 
           START=$(date +%s)
-          RESPONSE=$(curl -s http://127.0.0.1:11434/api/generate \
-            -d "$(jq -n --arg m "$MODEL" --arg p "$PROMPT" '{model:$m, prompt:$p, stream:false}')" \
-            | jq -r '.response // empty')
+          payload=$(jq -n --arg m "$MODEL" --arg p "$PROMPT" '{model:$m, prompt:$p, stream:false}')
+          RESPONSE=$(curl -s http://127.0.0.1:11434/api/generate -d "$payload" | jq -r '.response // empty')
           if [ -z "$RESPONSE" ]; then
             RESPONSE=$(ollama run "$MODEL" "$PROMPT" 2>/dev/null || echo "Matrix analysis failed for $MODEL / $STYLE")
           fi
@@ -778,7 +784,7 @@ ${CONTENT}"
           } > "$OUTFILE"
 
           echo "Wrote $OUTFILE in ${DURATION}s"
-          cat "$OUTFILE" | head -40
+          head -40 "$OUTFILE"
 
       - name: Upload matrix cell artifact
         uses: actions/upload-artifact@v4
@@ -825,7 +831,7 @@ ${CONTENT}"
             echo ""
             echo "## Actionability heuristic"
             echo "Larger detailed/technical outputs from larger models typically yield more actionable feedback."
-            BEST=$(find matrix-results -type f -name 'analysis-*.txt' -exec wc -c {} + 2>/dev/null | sort -n | tail -2 | head -1)
+            BEST=$(find matrix-results -type f -name 'analysis-*.txt' -exec wc -c {} + 2>/dev/null | sort -n | tail -2 | head -1 || true)
             echo "Largest analysis candidate: $BEST"
             echo ""
             echo "Models tested: llama3.2:1b (fast/lightweight), llama3.2:3b (more capable)."
