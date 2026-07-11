@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -51,3 +52,19 @@ def ollama_available() -> bool:
         return result.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
+
+
+def run_ollama_prompt(model_name: str, prompt: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    """Run a single Ollama generate via CLI."""
+    return subprocess.run(
+        ["ollama", "run", model_name, prompt],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+@pytest.fixture
+def ollama_run():
+    return run_ollama_prompt
