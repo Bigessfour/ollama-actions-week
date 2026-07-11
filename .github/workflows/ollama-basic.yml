@@ -1,0 +1,78 @@
+name: Ollama Basic Test Suite
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  OLLAMA_TEST_MODEL: llama3.2:1b
+
+jobs:
+  test-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Ollama (cached)
+        uses: ./.github/actions/setup-ollama
+        with:
+          model: ${{ env.OLLAMA_TEST_MODEL }}
+
+      - name: Align OLLAMA_MODELS with cached directory
+        run: |
+          echo "OLLAMA_MODELS=$HOME/.ollama/models" >> "$GITHUB_ENV"
+          mkdir -p "$HOME/.ollama/models"
+
+      - name: Install test dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run critical tests
+        run: pytest tests/ -m critical -v --tb=short
+
+      - name: Run full suite with coverage and JUnit
+        run: |
+          pytest tests/ -v --cov=tests --cov-report=xml:coverage.xml --junitxml=test-results.xml
+
+      - name: Run advisory tests
+        continue-on-error: true
+        run: pytest tests/ -m advisory -v --tb=short
+
+      - name: Collect performance timing artifacts
+        if: always()
+        run: |
+          mkdir -p test-artifacts
+          cp -f test-results.xml coverage.xml test-artifacts/ 2>/dev/null || true
+          find /tmp -name 'ollama-test-*' -type d 2>/dev/null | head -3 || true
+
+      - name: Write workflow summary
+        if: always()
+        run: |
+          {
+            echo "## Day 3 test suite"
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Model | \`${OLLAMA_TEST_MODEL}\` |"
+            echo "| Critical gate | \`pytest -m critical\` |"
+            echo "| Advisory step | \`continue-on-error: true\` |"
+            echo ""
+            if [ -f test-results.xml ]; then
+              echo "JUnit report: test-results.xml"
+            fi
+            if [ -f coverage.xml ]; then
+              echo "Coverage: coverage.xml"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-run-${{ github.run_number }}
+          path: |
+            test-results.xml
+            coverage.xml
+          retention-days: 30
